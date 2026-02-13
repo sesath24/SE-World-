@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="SE World">
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    html,body{width:100%;height:100%;overflow:hidden;background:#050510;font-family:system-ui,sans-serif}
+    #game{width:100%;height:100%}
+    .panel{position:fixed;top:10px;right:10px;background:rgba(20,20,40,0.95);border-radius:10px;color:#fff;font-size:12px;min-width:180px;box-shadow:0 4px 20px rgba(0,0,0,0.5);overflow:hidden;z-index:100}
+    .panel-title{font-weight:600;font-size:14px;padding:12px 15px;color:#8af;cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none}
+    .panel-title:hover{background:rgba(255,255,255,0.05)}
+    .panel-content{padding:0 15px 15px}
+    .panel.collapsed .panel-content{display:none}
+    .control{margin-bottom:10px}
+    .control label{display:block;color:#aaa;margin-bottom:4px;font-size:11px}
+    .control select{width:100%;padding:6px 8px;background:#1a1a2e;border:1px solid #333;color:#fff;border-radius:5px;cursor:pointer}
+    .btn{width:100%;padding:8px;background:linear-gradient(135deg,#4a8,#2a6);border:none;color:#fff;border-radius:5px;cursor:pointer;font-weight:600;margin-top:8px}
+    .btn:hover{filter:brightness(1.2)}
+    .stats{position:fixed;top:10px;left:10px;background:rgba(20,20,40,0.95);padding:10px 14px;border-radius:10px;color:#fff;font-size:12px;display:flex;flex-wrap:wrap;gap:10px;max-width:300px;z-index:100}
+    .stat{display:flex;align-items:center;gap:5px}
+    .dot{width:10px;height:10px;border-radius:50%}
+    .instructions{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);background:rgba(20,20,40,0.9);padding:10px 20px;border-radius:8px;color:#888;font-size:11px;z-index:100;text-align:center}
+    .victory{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) scale(0);background:rgba(10,10,30,0.98);padding:30px 50px;border-radius:15px;color:#fff;font-size:24px;text-align:center;z-index:200;opacity:0;transition:transform 0.5s cubic-bezier(0.175,0.885,0.32,1.275),opacity 0.3s ease}
+    .victory.show{transform:translate(-50%,-50%) scale(1);opacity:1}
+    .victory .sub{font-size:14px;color:#888;margin-top:10px}
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+  <div id="game"></div>
+  <div class="stats" id="stats"></div>
+  <div class="panel" id="panel">
+    <div class="panel-title" onclick="this.parentElement.classList.toggle('collapsed')">
+      <span>⚙️ Settings</span><span>▼</span>
+    </div>
+    <div class="panel-content">
+      <div class="control"><label>Planets</label>
+        <select id="planet-count"><option value="5">5</option><option value="8" selected>8</option><option value="10">10</option><option value="12">12</option></select>
+      </div>
+      <div class="control"><label>AI Opponents</label>
+        <select id="ai-count"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
+      </div>
+      <div class="control"><label>Send %</label>
+        <select id="send-pct"><option value="0.25">25%</option><option value="0.5" selected>50%</option><option value="0.75">75%</option><option value="1">100%</option></select>
+      </div>
+      <button class="btn" id="restart-btn">🔄 New Game</button>
+    </div>
+  </div>
+  <div class="instructions">Drag from your planet (blue) to attack • Left-drag to orbit camera • Scroll to zoom • Click planet to focus</div>
+  <div class="victory" id="victory"><span id="victory-text"></span><div class="sub">Click New Game to play again</div></div>
+
+<script>
+const COLORS=[0x666666,0x44aaff,0xff5555,0xffaa00,0xaa44ff,0x44ffaa];
+const COLOR_VEC=[new THREE.Color(0x666666),new THREE.Color(0x44aaff),new THREE.Color(0xff5555),new THREE.Color(0xffaa00),new THREE.Color(0xaa44ff),new THREE.Color(0x44ffaa)];
+let cfg={planets:8,aiCount:1,sendPct:0.5};
+let scene,camera,renderer,planets=[],boids=[],lasers=[];
+let selectedPlanet=null,dragLine=null,raycaster,mouse,gameOver=false;
+let isDragging=false,dragMoved=false,isOrbiting=false,lastMouse={x:0,y:0};
+let camTarget=new THREE.Vector3(),camDist=250,camTheta=0.5,camPhi=0.8;
+let aiTimers=[],clock=new THREE.Clock();
+
+const planetVert=`
+varying vec3 vNormal;
+varying vec3 vPosition;
+void main(){
+  vNormal=normalize(normalMatrix*normal);
+  vPosition=position;
+  gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);
+}`;
+
+const planetFrag=`
+uniform vec3 uColor;
+uniform float uTime;
+varying vec3 vNormal;
+varying vec3 vPosition;
+
+float hash(vec3 p){
+  p=fract(p*0.3183099+.1);
+  p*=17.0;
+  return fract(p.x*p.y*p.z*(p.x+p.y+p.z));
+}
+
+float noise(vec3 p){
+  vec3 i=floor(p);
+  vec3 f=fract(p);
+  f=f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x),
+                 mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),
+                 mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z);
+}
+
+float fbm(vec3 p){
+  float v=0.0,a=0.5;
+  for(int i=0;i<5;i++){
+    v+=a*noise(p);
+    p*=2.0;
+    a*=0.5;
+  }
+  return v;
+}
+
+void main(){
+  vec3 n=normalize(vNormal);
+  float nz=fbm(vPosition*2.5+uTime*0.02);
+  float nz2=fbm(vPosition*5.0-uTime*0.01);
+  vec3 baseColor=uColor*0.4;
+  vec3 highlight=uColor*1.2;
+  vec3 dark=uColor*0.15;
+  vec3 col=mix(dark,baseColor,nz);
+  col=mix(col,highlight,nz2*0.3);
+  float rim=1.0-max(0.0,dot(n,vec3(0,0,1)));
+  col+=uColor*rim*0.3;
+  float light=max(0.0,dot(n,normalize(vec3(0.5,1.0,0.8))))*0.3+0.7;
+  col*=light;
+  gl_FragColor=vec4(col,0.95);
+}`;
+
+function init(){
+  scene=new THREE.Scene();
+  camera=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,1,2000);
+  renderer=new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(innerWidth,innerHeight);
+  renderer.setClearColor(0x050510);
+  document.getElementById('game').appendChild(renderer.domElement);
+  
+  raycaster=new THREE.Raycaster();
+  mouse=new THREE.Vector2();
+  
+  scene.add(new THREE.AmbientLight(0x606080,0.4));
+  const sun=new THREE.DirectionalLight(0xffffff,0.3);
+  sun.position.set(100,200,150);
+  scene.add(sun);
+  
+  const starGeo=new THREE.BufferGeometry();
+  const starPos=[],starCol=[];
+  for(let i=0;i<3000;i++){
+    starPos.push((Math.random()-0.5)*1800,(Math.random()-0.5)*1800,(Math.random()-0.5)*1800);
+    const b=0.5+Math.random()*0.5;
+    starCol.push(b,b,b+Math.random()*0.2);
+  }
+  starGeo.setAttribute('position',new THREE.Float32BufferAttribute(starPos,3));
+  starGeo.setAttribute('color',new THREE.Float32BufferAttribute(starCol,3));
+  scene.add(new THREE.Points(starGeo,new THREE.PointsMaterial({size:1.5,vertexColors:true,transparent:true,opacity:0.8})));
+  
+  const lineMat=new THREE.LineBasicMaterial({color:0x44aaff,transparent:true,opacity:0.8});
+  const lineGeo=new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(),new THREE.Vector3()]);
+  dragLine=new THREE.Line(lineGeo,lineMat);
+  dragLine.visible=false;
+  scene.add(dragLine);
+  
+  spawnPlanets();
+  setupInput();
+  updateStats();
+  updateCamera();
+  animate();
+}
+
+function spawnPlanets(){
+  planets.forEach(p=>{scene.remove(p.mesh);scene.remove(p.glow)});
+  boids.forEach(b=>scene.remove(b.mesh));
+  lasers.forEach(l=>scene.remove(l.line));
+  planets=[];boids=[];lasers=[];
+  gameOver=false;
+  document.getElementById('victory').classList.remove('show');
+  
+  const positions=[];
+  const spread=120;
+  const homeAngles=[0,Math.PI,Math.PI/2,-Math.PI/2,Math.PI/4,-Math.PI/4];
+  for(let i=1;i<=cfg.aiCount+1;i++){
+    const a=homeAngles[i-1];
+    const y=(Math.random()-0.5)*60;
+    positions.push({x:Math.cos(a)*spread,y,z:Math.sin(a)*spread,r:12,owner:i});
+  }
+  
+  let attempts=0;
+  while(positions.length<cfg.planets&&attempts<500){
+    attempts++;
+    const x=(Math.random()-0.5)*spread*2;
+    const y=(Math.random()-0.5)*spread;
+    const z=(Math.random()-0.5)*spread*2;
+    const r=6+Math.random()*6;
+    let valid=true;
+    for(let p of positions){
+      const d=Math.sqrt((x-p.x)**2+(y-p.y)**2+(z-p.z)**2);
+      if(d<p.r+r+35){valid=false;break}
+    }
+    if(valid)positions.push({x,y,z,r,owner:0});
+  }
+  
+  positions.forEach(p=>{
+    const planet=createPlanet(p.x,p.y,p.z,p.r,p.owner);
+    planets.push(planet);
+    const startBoids=p.owner>0?8:2;
+    for(let i=0;i<startBoids;i++)addBoid(planet,p.owner);
+  });
+  
+  aiTimers=[];
+  for(let i=0;i<cfg.aiCount;i++)aiTimers.push(1500+Math.random()*1500);
+}
+
+function createPlanet(x,y,z,r,owner){
+  const geo=new THREE.SphereGeometry(r,48,48);
+  const mat=new THREE.ShaderMaterial({
+    uniforms:{uColor:{value:COLOR_VEC[owner]},uTime:{value:0}},
+    vertexShader:planetVert,
+    fragmentShader:planetFrag,
+    transparent:true
+  });
+  const mesh=new THREE.Mesh(geo,mat);
+  mesh.position.set(x,y,z);
+  scene.add(mesh);
+  
+  const glowGeo=new THREE.SphereGeometry(r*1.4,16,16);
+  const glowMat=new THREE.MeshBasicMaterial({color:COLORS[owner],transparent:true,opacity:0.08,side:THREE.BackSide});
+  const glow=new THREE.Mesh(glowGeo,glowMat);
+  glow.position.copy(mesh.position);
+  scene.add(glow);
+  
+  return{mesh,glow,x,y,z,r,owner,boids:[],genTimer:0,genTime:1800};
+}
+
+function addBoid(planet,owner){
+  const geo=new THREE.ConeGeometry(1.2,3.5,4);
+  geo.rotateX(Math.PI/2);
+  const mat=new THREE.MeshBasicMaterial({color:COLORS[owner]});
+  const mesh=new THREE.Mesh(geo,mat);
+  
+  const orbitAxis=new THREE.Vector3(Math.random()-0.5,Math.random()-0.5,Math.random()-0.5).normalize();
+  const orbitAngle=Math.random()*Math.PI*2;
+  const orbitDist=planet.r+6+Math.random()*10;
+  const orbitSpeed=0.4+Math.random()*0.3;
+  
+  const boid={mesh,planet,owner,target:null,traveling:false,orbitAxis,orbitAngle,orbitDist,orbitSpeed,speed:0.7+Math.random()*0.2,lastFire:0,vel:new THREE.Vector3(),prevPos:new THREE.Vector3()};
+  updateBoidOrbit(boid);
+  boid.prevPos.copy(boid.mesh.position);
+  scene.add(mesh);
+  boids.push(boid);
+  planet.boids.push(boid);
+  return boid;
+}
+
+function updateBoidOrbit(b){
+  if(!b.planet)return;
+  const q=new THREE.Quaternion().setFromAxisAngle(b.orbitAxis,b.orbitAngle);
+  const offset=new THREE.Vector3(b.orbitDist,0,0).applyQuaternion(q);
+  b.mesh.position.set(b.planet.x+offset.x,b.planet.y+offset.y,b.planet.z+offset.z);
+}
+
+function setupInput(){
+  const canvas=renderer.domElement;
+  
+  canvas.addEventListener('mousedown',e=>{
+    lastMouse={x:e.clientX,y:e.clientY};
+    dragMoved=false;
+    
+    if(e.button===0){
+      mouse.x=(e.clientX/innerWidth)*2-1;
+      mouse.y=-(e.clientY/innerHeight)*2+1;
+      raycaster.setFromCamera(mouse,camera);
+      const hits=raycaster.intersectObjects(planets.map(p=>p.mesh));
+      
+      if(hits.length>0&&!gameOver){
+        const p=planets.find(pl=>pl.mesh===hits[0].object);
+        if(p&&p.owner===1){
+          selectedPlanet=p;
+          isDragging=true;
+          dragLine.visible=true;
+        }else{
+          isOrbiting=true;
+        }
+      }else{
+        isOrbiting=true;
+      }
+    }
+  });
+  
+  canvas.addEventListener('mousemove',e=>{
+    const dx=e.clientX-lastMouse.x,dy=e.clientY-lastMouse.y;
+    if(Math.abs(dx)>3||Math.abs(dy)>3)dragMoved=true;
+    
+    if(isOrbiting){
+      camTheta-=dx*0.008;
+      camPhi=Math.max(0.1,Math.min(Math.PI-0.1,camPhi-dy*0.008));
+      lastMouse={x:e.clientX,y:e.clientY};
+      updateCamera();
+      return;
+    }
+    
+    if(isDragging&&selectedPlanet){
+      mouse.x=(e.clientX/innerWidth)*2-1;
+      mouse.y=-(e.clientY/innerHeight)*2+1;
+      raycaster.setFromCamera(mouse,camera);
+      
+      const camDir=new THREE.Vector3();
+      camera.getWorldDirection(camDir);
+      const plane=new THREE.Plane(camDir.negate(),0);
+      plane.constant=-camDir.dot(new THREE.Vector3(selectedPlanet.x,selectedPlanet.y,selectedPlanet.z));
+      
+      const start=new THREE.Vector3(selectedPlanet.x,selectedPlanet.y,selectedPlanet.z);
+      const end=new THREE.Vector3();
+      raycaster.ray.intersectPlane(plane,end);
+      if(!end.x)end.copy(start);
+      
+      const linePos=dragLine.geometry.attributes.position.array;
+      linePos[0]=start.x;linePos[1]=start.y;linePos[2]=start.z;
+      linePos[3]=end.x;linePos[4]=end.y;linePos[5]=end.z;
+      dragLine.geometry.attributes.position.needsUpdate=true;
+    }
+  });
+  
+  canvas.addEventListener('mouseup',e=>{
+    if(isDragging&&selectedPlanet){
+      mouse.x=(e.clientX/innerWidth)*2-1;
+      mouse.y=-(e.clientY/innerHeight)*2+1;
+      raycaster.setFromCamera(mouse,camera);
+      const hits=raycaster.intersectObjects(planets.map(p=>p.mesh));
+      if(hits.length>0){
+        const target=planets.find(pl=>pl.mesh===hits[0].object);
+        if(target&&target!==selectedPlanet)sendBoids(selectedPlanet,target,cfg.sendPct);
+      }
+    }
+    
+    if(!dragMoved&&!isDragging&&e.button===0){
+      mouse.x=(e.clientX/innerWidth)*2-1;
+      mouse.y=-(e.clientY/innerHeight)*2+1;
+      raycaster.setFromCamera(mouse,camera);
+      const hits=raycaster.intersectObjects(planets.map(p=>p.mesh));
+      if(hits.length>0){
+        const p=planets.find(pl=>pl.mesh===hits[0].object);
+        if(p){camTarget.set(p.x,p.y,p.z);updateCamera()}
+      }
+    }
+    
+    isDragging=false;
+    isOrbiting=false;
+    selectedPlanet=null;
+    dragLine.visible=false;
+  });
+  
+  canvas.addEventListener('wheel',e=>{
+    camDist=Math.max(60,Math.min(500,camDist+e.deltaY*0.4));
+    updateCamera();
+  });
+  
+  canvas.addEventListener('contextmenu',e=>e.preventDefault());
+  window.addEventListener('resize',()=>{
+    camera.aspect=innerWidth/innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth,innerHeight);
+  });
+}
+
+function updateCamera(){
+  camera.position.x=camTarget.x+Math.sin(camPhi)*Math.cos(camTheta)*camDist;
+  camera.position.y=camTarget.y+Math.cos(camPhi)*camDist;
+  camera.position.z=camTarget.z+Math.sin(camPhi)*Math.sin(camTheta)*camDist;
+  camera.lookAt(camTarget);
+}
+
+function sendBoids(from,to,pct){
+  const count=Math.floor(from.boids.length*pct);
+  for(let i=0;i<count&&from.boids.length>0;i++){
+    const b=from.boids.pop();
+    b.planet=null;
+    b.target=to;
+    b.traveling=true;
+  }
+}
+
+function fireLaser(from,to,color){
+  const geo=new THREE.BufferGeometry().setFromPoints([from.clone(),to.clone()]);
+  const mat=new THREE.LineBasicMaterial({color,transparent:true,opacity:1,linewidth:2});
+  const line=new THREE.Line(geo,mat);
+  scene.add(line);
+  lasers.push({line,life:1});
+}
+
+function applyFlocking(b,dt){
+  if(!b.planet)return;
+  const neighbors=b.planet.boids.filter(o=>o!==b);
+  if(neighbors.length===0)return;
+  
+  let sepX=0,sepY=0,sepZ=0,sepCount=0;
+  let alignSpeed=0,alignCount=0;
+  
+  for(let o of neighbors){
+    const dx=b.mesh.position.x-o.mesh.position.x;
+    const dy=b.mesh.position.y-o.mesh.position.y;
+    const dz=b.mesh.position.z-o.mesh.position.z;
+    const d=Math.sqrt(dx*dx+dy*dy+dz*dz);
+    
+    if(d<8&&d>0){
+      sepX+=dx/d;sepY+=dy/d;sepZ+=dz/d;
+      sepCount++;
+    }
+    if(d<15){
+      alignSpeed+=o.orbitSpeed;
+      alignCount++;
+    }
+  }
+  
+  if(sepCount>0){
+    const sep=new THREE.Vector3(sepX/sepCount,sepY/sepCount,sepZ/sepCount);
+    const toCenter=new THREE.Vector3(b.planet.x-b.mesh.position.x,b.planet.y-b.mesh.position.y,b.planet.z-b.mesh.position.z).normalize();
+    sep.sub(toCenter.multiplyScalar(sep.dot(toCenter)));
+    const tangent=new THREE.Vector3().crossVectors(b.orbitAxis,b.mesh.position.clone().sub(new THREE.Vector3(b.planet.x,b.planet.y,b.planet.z))).normalize();
+    const sepInfluence=sep.dot(tangent)*0.002;
+    b.orbitSpeed+=sepInfluence;
+  }
+  
+  if(alignCount>0){
+    const avgSpeed=alignSpeed/alignCount;
+    b.orbitSpeed+=(avgSpeed-b.orbitSpeed)*0.01;
+  }
+  
+  b.orbitSpeed=Math.max(0.2,Math.min(0.8,b.orbitSpeed));
+}
+
+function updateBoids(dt){
+  const time=performance.now();
+  
+  for(let i=boids.length-1;i>=0;i--){
+    const b=boids[i];
+    b.prevPos.copy(b.mesh.position);
+    
+    if(b.traveling&&b.target){
+      const dir=new THREE.Vector3(b.target.x-b.mesh.position.x,b.target.y-b.mesh.position.y,b.target.z-b.mesh.position.z);
+      const dist=dir.length();
+      
+      if(dist<b.target.r+3){
+        if(b.target.owner===b.owner){
+          b.target.boids.push(b);
+          b.planet=b.target;
+          b.target=null;
+          b.traveling=false;
+          b.orbitAxis=new THREE.Vector3(Math.random()-0.5,Math.random()-0.5,Math.random()-0.5).normalize();
+          b.orbitAngle=Math.random()*Math.PI*2;
+          b.orbitDist=b.planet.r+6+Math.random()*10;
+        }else if(b.target.boids.length>0){
+          const enemy=b.target.boids.pop();
+          scene.remove(enemy.mesh);
+          boids.splice(boids.indexOf(enemy),1);
+          scene.remove(b.mesh);
+          boids.splice(i,1);
+        }else{
+          b.target.owner=b.owner;
+          b.target.mesh.material.uniforms.uColor.value=COLOR_VEC[b.owner];
+          b.target.glow.material.color.setHex(COLORS[b.owner]);
+          b.target.boids.push(b);
+          b.planet=b.target;
+          b.target=null;
+          b.traveling=false;
+          b.orbitAxis=new THREE.Vector3(Math.random()-0.5,Math.random()-0.5,Math.random()-0.5).normalize();
+          b.orbitAngle=Math.random()*Math.PI*2;
+        }
+        continue;
+      }
+      
+      dir.normalize().multiplyScalar(b.speed);
+      b.mesh.position.add(dir);
+      b.vel.copy(dir);
+      
+      if(time-b.lastFire>2000){
+        for(let other of boids){
+          if(other===b||other.owner===b.owner||other.owner===0)continue;
+          const d=b.mesh.position.distanceTo(other.mesh.position);
+          if(d<40){
+            b.lastFire=time;
+            fireLaser(b.mesh.position,other.mesh.position,COLORS[b.owner]);
+            scene.remove(other.mesh);
+            if(other.planet){
+              const idx=other.planet.boids.indexOf(other);
+              if(idx>=0)other.planet.boids.splice(idx,1);
+            }
+            boids.splice(boids.indexOf(other),1);
+            break;
+          }
+        }
+      }
+    }else if(b.planet){
+      applyFlocking(b,dt);
+      b.orbitAngle+=b.orbitSpeed*dt;
+      updateBoidOrbit(b);
+      b.vel.copy(b.mesh.position).sub(b.prevPos);
+    }
+    
+    if(b.vel.lengthSq()>0.0001){
+      const lookTarget=b.mesh.position.clone().add(b.vel.normalize());
+      b.mesh.lookAt(lookTarget);
+    }
+  }
+}
+
+function updatePlanets(dt,time){
+  for(let p of planets){
+    p.mesh.material.uniforms.uTime.value=time;
+    if(p.owner>0&&p.boids.length<30){
+      p.genTimer+=dt*1000;
+      if(p.genTimer>=p.genTime){
+        p.genTimer=0;
+        addBoid(p,p.owner);
+      }
+    }
+  }
+}
+
+function updateLasers(dt){
+  for(let i=lasers.length-1;i>=0;i--){
+    lasers[i].life-=dt*5;
+    lasers[i].line.material.opacity=lasers[i].life;
+    if(lasers[i].life<=0){
+      scene.remove(lasers[i].line);
+      lasers.splice(i,1);
+    }
+  }
+}
+
+function aiTurn(ai){
+  const myPlanets=planets.filter(p=>p.owner===ai&&p.boids.length>6);
+  if(myPlanets.length===0)return;
+  const src=myPlanets[Math.floor(Math.random()*myPlanets.length)];
+  const targets=planets.filter(p=>p.owner!==ai);
+  if(targets.length===0)return;
+  targets.sort((a,b)=>{
+    const da=Math.sqrt((a.x-src.x)**2+(a.y-src.y)**2+(a.z-src.z)**2);
+    const db=Math.sqrt((b.x-src.x)**2+(b.y-src.y)**2+(b.z-src.z)**2);
+    return(da*0.5+a.boids.length*6)-(db*0.5+b.boids.length*6);
+  });
+  if(src.boids.length>targets[0].boids.length+3)sendBoids(src,targets[0],0.55);
+}
+
+function checkVictory(){
+  if(gameOver)return;
+  const playerPlanets=planets.filter(p=>p.owner===1);
+  const aiPlanets=planets.filter(p=>p.owner>1);
+  const playerBoids=boids.filter(b=>b.owner===1&&b.traveling);
+  const aiBoids=boids.filter(b=>b.owner>1&&b.traveling);
+  
+  if(aiPlanets.length===0&&aiBoids.length===0){
+    gameOver=true;
+    document.getElementById('victory-text').textContent='🎉 You Win!';
+    document.getElementById('victory').classList.add('show');
+  }else if(playerPlanets.length===0&&playerBoids.length===0){
+    gameOver=true;
+    document.getElementById('victory-text').textContent='😵 You Lose!';
+    document.getElementById('victory').classList.add('show');
+  }
+}
+
+function updateStats(){
+  const container=document.getElementById('stats');
+  let html=`<div class="stat"><div class="dot" style="background:#4af"></div>You: ${planets.filter(p=>p.owner===1).length}</div>`;
+  for(let i=0;i<cfg.aiCount;i++){
+    const colors=['#f55','#fa0','#a4f'];
+    html+=`<div class="stat"><div class="dot" style="background:${colors[i]}"></div>AI${i+1}: ${planets.filter(p=>p.owner===i+2).length}</div>`;
+  }
+  html+=`<div class="stat"><div class="dot" style="background:#666"></div>Neutral: ${planets.filter(p=>p.owner===0).length}</div>`;
+  container.innerHTML=html;
+}
+
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=Math.min(clock.getDelta(),0.1);
+  const time=clock.elapsedTime;
+  
+  if(!gameOver){
+    for(let i=0;i<cfg.aiCount;i++){
+      aiTimers[i]-=dt*1000;
+      if(aiTimers[i]<=0){
+        aiTimers[i]=1500+Math.random()*1500;
+        aiTurn(i+2);
+      }
+    }
+  }
+  
+  updateBoids(dt);
+  updatePlanets(dt,time);
+  updateLasers(dt);
+  checkVictory();
+  updateStats();
+  renderer.render(scene,camera);
+}
+
+document.getElementById('planet-count').onchange=e=>cfg.planets=parseInt(e.target.value);
+document.getElementById('ai-count').onchange=e=>cfg.aiCount=parseInt(e.target.value);
+document.getElementById('send-pct').onchange=e=>cfg.sendPct=parseFloat(e.target.value);
+document.getElementById('restart-btn').onclick=spawnPlanets;
+
+init();
+</script>
+<Create By Sesath Jeewandara> SE Project </Create>
+</body>
+</html>
